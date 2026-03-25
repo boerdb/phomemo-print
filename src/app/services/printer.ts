@@ -5,8 +5,10 @@ import { Capacitor } from '@capacitor/core';
 const DEFAULT_SERVICE_UUID = '0000ff00-0000-1000-8000-00805f9b34fb';
 const DEFAULT_CHAR_UUID    = '0000ff02-0000-1000-8000-00805f9b34fb';
 const NOTIFY_CHAR_UUID     = '0000ff03-0000-1000-8000-00805f9b34fb';
-const CHUNK_SIZE = 64;   // klein voor stabiliteit tijdens debuggen
-const CHUNK_DELAY = 100; // ms tussen chunks
+const KNOWN_PRINTER_NAME   = 'Q199G4C40030033';
+const LAST_DEVICE_ID_KEY   = 'phomemo.lastDeviceId';
+const CHUNK_SIZE = 512;  // BLE MTU op Android ondersteunt tot 512 bytes
+const CHUNK_DELAY = 20;  // ms tussen chunks (was 100ms debug)
 
 const PROFILE_CANDIDATES = [
   // Phomemo M110 — ff00 service (gevonden via BLE scan)
@@ -34,11 +36,143 @@ const PROFILE_CANDIDATES = [
 })
 export class PrinterService {
   private deviceId: string | null = null;
+  private deviceName: string | null = null;
   private serviceUuid = DEFAULT_SERVICE_UUID;
   private charUuid = DEFAULT_CHAR_UUID;
   private notifyUuid: string | null = NOTIFY_CHAR_UUID;
   private preferWriteWithoutResponse = false;
   discoveredInfo = '';
+
+  getConnectedDeviceName(): string | null {
+    return this.deviceName;
+  }
+
+  private saveLastDeviceId(deviceId: string): void {
+    try {
+      localStorage.setItem(LAST_DEVICE_ID_KEY, deviceId);
+    } catch {
+      // Opslaan mag falen zonder de printflow te blokkeren.
+    }
+  }
+
+  private getLastDeviceId(): string | null {
+    try {
+      return localStorage.getItem(LAST_DEVICE_ID_KEY);
+    } catch {
+      return null;
+    }
+  }
+
+  forgetSavedPrinter(): void {
+    this.deviceId = null;
+    this.deviceName = null;
+    try {
+      localStorage.removeItem(LAST_DEVICE_ID_KEY);
+    } catch {
+      // Geen probleem als storage niet beschikbaar is.
+    }
+  }
+
+  async autoReconnectSaved(): Promise<boolean> {
+    const savedDeviceId = this.getLastDeviceId();
+    if (!savedDeviceId) {
+      return false;
+    }
+
+    try {
+      await this.ensureBleReady();
+      this.deviceId = savedDeviceId;
+      await BleClient.disconnect(savedDeviceId).catch(() => undefined);
+      await BleClient.connect(savedDeviceId);
+      await this.configureConnectedPrinter(savedDeviceId);
+      return true;
+    } catch (error) {
+      console.warn('Auto-reconnect mislukt:', error);
+      this.deviceId = null;
+      return false;
+    }
+  }
+
+  private async configureConnectedPrinter(deviceId: string): Promise<void> {
+    // discoverServices is verplicht op Android vóór elke read/write.
+    await BleClient.discoverServices(deviceId);
+    const services = await BleClient.getServices(deviceId);
+
+    // Dump alle gevonden UUIDs + properties naar de UI voor debugging.
+    this.discoveredInfo = '';
+    for (const svc of services) {
+      this.discoveredInfo += `Service: ${svc.uuid}\n`;
+      for (const ch of svc.characteristics) {
+        this.discoveredInfo += `  Char: ${ch.uuid}\n`;
+        this.discoveredInfo += `    Props: ${JSON.stringify(ch.properties)}\n`;
+        if (ch.properties.read) {
+          try {
+            const val = await BleClient.read(deviceId, svc.uuid, ch.uuid);
+            this.discoveredInfo += `    Read: ${Array.from(new Uint8Array(val.buffer)).map(b => b.toString(16).padStart(2,'0')).join(' ')}\n`;
+          } catch (e) {
+            this.discoveredInfo += `    Read failed: ${e}\n`;
+          }
+        }
+      }
+    }
+    console.log('Gevonden BLE services:\n' + this.discoveredInfo);
+
+    // Stap 1: zoek een bekend Phomemo profiel.
+    let found = false;
+    for (const profile of PROFILE_CANDIDATES) {
+      const svc = services.find(s => s.uuid.toLowerCase() === profile.service);
+      if (!svc) continue;
+      const wch = svc.characteristics.find(c => c.uuid.toLowerCase() === profile.writeChar
+        && (c.properties.write || c.properties.writeWithoutResponse));
+      if (!wch) continue;
+      this.serviceUuid = svc.uuid;
+      this.charUuid = wch.uuid;
+      this.preferWriteWithoutResponse = !!wch.properties.writeWithoutResponse;
+      this.notifyUuid = profile.notifyChar ?? null;
+      found = true;
+      break;
+    }
+
+    // Stap 2: geen bekend profiel → neem de eerste schrijfbare characteristic.
+    if (!found) {
+      outer2: for (const svc of services) {
+        for (const ch of svc.characteristics) {
+          if (ch.properties.write || ch.properties.writeWithoutResponse) {
+            this.serviceUuid = svc.uuid;
+            this.charUuid = ch.uuid;
+            this.preferWriteWithoutResponse = !!ch.properties.writeWithoutResponse && !ch.properties.write;
+            this.notifyUuid = null;
+            found = true;
+            break outer2;
+          }
+        }
+      }
+    }
+
+    if (!found) {
+      throw new Error('Geen schrijfbare BLE characteristic gevonden. Zie "Gevonden services" in de app.');
+    }
+
+    console.log('Schrijfbare target:', this.serviceUuid, this.charUuid, 'WnR:', this.preferWriteWithoutResponse, 'Notify:', this.notifyUuid);
+
+    // Subscribe op de notify-characteristic voor printer-status (bijv. ff03).
+    if (this.notifyUuid) {
+      try {
+        await BleClient.startNotifications(
+          deviceId,
+          this.serviceUuid,
+          this.notifyUuid,
+          (value) => {
+            const bytes = Array.from(new Uint8Array(value.buffer)).map(b => b.toString(16).padStart(2,'0')).join(' ');
+            console.log('Printer status notificatie:', bytes);
+          }
+        );
+        console.log('Notificaties ingeschakeld op', this.notifyUuid);
+      } catch (e) {
+        console.log('Notificaties niet ondersteund:', e);
+      }
+    }
+  }
 
   private async ensureBleReady(): Promise<void> {
     await BleClient.initialize();
@@ -76,6 +210,53 @@ export class PrinterService {
     return Array.from(devices.values());
   }
 
+  private isLikelyPhomemo(device: BleDevice): boolean {
+    const name = (device.name || '').toLowerCase();
+    return name === KNOWN_PRINTER_NAME.toLowerCase() || name.includes('phomemo') || name.includes('m110');
+  }
+
+  private async connectByDeviceId(deviceId: string): Promise<void> {
+    this.deviceId = deviceId;
+    await BleClient.disconnect(deviceId).catch(() => undefined);
+    await BleClient.connect(deviceId);
+    const devices = await BleClient.getDevices([deviceId]).catch(() => [] as BleDevice[]);
+    this.deviceName = devices[0]?.name || this.deviceName || deviceId;
+    await this.configureConnectedPrinter(deviceId);
+    this.saveLastDeviceId(deviceId);
+  }
+
+  private async tryConnectFromBondedDevices(): Promise<boolean> {
+    if (Capacitor.getPlatform() !== 'android') {
+      return false;
+    }
+
+    let bonded: BleDevice[] = [];
+    try {
+      bonded = await BleClient.getBondedDevices();
+    } catch (e) {
+      console.log('Bonded devices niet beschikbaar:', e);
+      return false;
+    }
+
+    if (bonded.length === 0) {
+      return false;
+    }
+
+    const preferred = bonded.find((d) => this.isLikelyPhomemo(d)) ?? bonded[0];
+    if (!preferred?.deviceId) {
+      return false;
+    }
+
+    try {
+      await this.connectByDeviceId(preferred.deviceId);
+      console.log('Verbonden via Android gekoppeld apparaat:', preferred.name || preferred.deviceId);
+      return true;
+    } catch (e) {
+      console.warn('Verbinden via gekoppeld apparaat mislukt:', e);
+      return false;
+    }
+  }
+
   /**
    * Verbindt met de Phomemo M110 via één device picker.
    */
@@ -83,97 +264,23 @@ export class PrinterService {
     try {
       await this.ensureBleReady();
 
+      // Eerst proberen via al gekoppelde Android BLE apparaten.
+      // Dit helpt wanneer requestDevice() niets toont terwijl de printer al "gekoppeld" staat.
+      if (await this.tryConnectFromBondedDevices()) {
+        return true;
+      }
+
       const device = await BleClient.requestDevice({
         optionalServices: PROFILE_CANDIDATES.map(p => p.service) as string[],
       });
-      this.deviceId = device.deviceId;
-
-      await BleClient.disconnect(this.deviceId).catch(() => undefined);
-      await BleClient.connect(this.deviceId);
-
-      // discoverServices is verplicht op Android vóór elke read/write.
-      await BleClient.discoverServices(this.deviceId);
-      const services = await BleClient.getServices(this.deviceId);
-
-      // Dump alle gevonden UUIDs + properties naar de UI voor debugging.
-      this.discoveredInfo = '';
-      for (const svc of services) {
-        this.discoveredInfo += `Service: ${svc.uuid}\n`;
-        for (const ch of svc.characteristics) {
-          this.discoveredInfo += `  Char: ${ch.uuid}\n`;
-          this.discoveredInfo += `    Props: ${JSON.stringify(ch.properties)}\n`;
-          if (ch.properties.read) {
-            try {
-              const val = await BleClient.read(this.deviceId!, svc.uuid, ch.uuid);
-              this.discoveredInfo += `    Read: ${Array.from(new Uint8Array(val.buffer)).map(b => b.toString(16).padStart(2,'0')).join(' ')}\n`;
-            } catch (e) {
-              this.discoveredInfo += `    Read failed: ${e}\n`;
-            }
-          }
-        }
-      }
-      console.log('Gevonden BLE services:\n' + this.discoveredInfo);
-
-      // Stap 1: zoek een bekend Phomemo profiel.
-      let found = false;
-      for (const profile of PROFILE_CANDIDATES) {
-        const svc = services.find(s => s.uuid.toLowerCase() === profile.service);
-        if (!svc) continue;
-        const wch = svc.characteristics.find(c => c.uuid.toLowerCase() === profile.writeChar
-          && (c.properties.write || c.properties.writeWithoutResponse));
-        if (!wch) continue;
-        this.serviceUuid = svc.uuid;
-        this.charUuid = wch.uuid;
-        this.preferWriteWithoutResponse = !!wch.properties.writeWithoutResponse;
-        this.notifyUuid = profile.notifyChar ?? null;
-        found = true;
-        break;
-      }
-
-      // Stap 2: geen bekend profiel → neem de eerste schrijfbare characteristic.
-      if (!found) {
-        outer2: for (const svc of services) {
-          for (const ch of svc.characteristics) {
-            if (ch.properties.write || ch.properties.writeWithoutResponse) {
-              this.serviceUuid = svc.uuid;
-              this.charUuid = ch.uuid;
-              this.preferWriteWithoutResponse = !!ch.properties.writeWithoutResponse && !ch.properties.write;
-              this.notifyUuid = null;
-              found = true;
-              break outer2;
-            }
-          }
-        }
-      }
-
-      if (!found) {
-        throw new Error('Geen schrijfbare BLE characteristic gevonden. Zie "Gevonden services" in de app.');
-      }
-
-      console.log('Schrijfbare target:', this.serviceUuid, this.charUuid, 'WnR:', this.preferWriteWithoutResponse, 'Notify:', this.notifyUuid);
-
-      // Subscribe op de notify-characteristic voor printer-status (bijv. ff03).
-      if (this.notifyUuid) {
-        try {
-          await BleClient.startNotifications(
-            this.deviceId,
-            this.serviceUuid,
-            this.notifyUuid,
-            (value) => {
-              const bytes = Array.from(new Uint8Array(value.buffer)).map(b => b.toString(16).padStart(2,'0')).join(' ');
-              console.log('Printer status notificatie:', bytes);
-            }
-          );
-          console.log('Notificaties ingeschakeld op', this.notifyUuid);
-        } catch (e) {
-          console.log('Notificaties niet ondersteund:', e);
-        }
-      }
+      this.deviceName = device.name || device.deviceId;
+      await this.connectByDeviceId(device.deviceId);
 
       return true;
     } catch (error) {
       console.warn('Bluetooth verbinding mislukt:', error);
       this.deviceId = null;
+      this.deviceName = null;
       return false;
     }
   }
@@ -282,6 +389,8 @@ export class PrinterService {
       this.notifyUuid  = '0000ae02-0000-1000-8000-00805f9b34fb';
       this.preferWriteWithoutResponse = false;
       console.log('Geforceerd alternatief profiel ae30/ae01');
+
+      this.saveLastDeviceId(this.deviceId);
 
       await this.simpleTextPrint();
       return true;
