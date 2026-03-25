@@ -20,7 +20,8 @@
     "module": "es2020",
     "lib": ["es2018", "dom"],
     "skipLibCheck": true,
-    "useDefineForClassFields": false
+    "useDefineForClassFields": false,
+    "types": ["web-bluetooth"]
   },
   "angularCompilerOptions": {
     "enableI18nLegacyMessageIdFormat": false,
