@@ -1,0 +1,7 @@
+{
+  "name": "phomemo-print",
+  "integrations": {
+    "capacitor": {}
+  },
+  "type": "angular-standalone"
+}
